@@ -2,6 +2,7 @@
 # They are provided by a third-party and are governed by
 # separate terms of service, privacy policy, and support
 # documentation.
+
 name: Scheduled Nightly Build
 
 on:
@@ -35,23 +36,24 @@ jobs:
         shell: powershell
         run: |
           $resourceFile = ".\OptiScaler\resource.h"
+
           if (-Not (Test-Path $resourceFile)) {
-              Write-Error "File not found: $resourceFile"
-              exit 1
+            Write-Error "File not found: $resourceFile"
+            exit 1
           }
 
           function Get-Version-Component {
-              param (
-                  [string]$pattern,
-                  [string]$replacement
-              )
-              $line = Get-Content $resourceFile | Select-String -Pattern $pattern | Select-Object -First 1
-              if ($line) {
-                  return ($line.Line -replace $replacement).Trim()
-              } else {
-                  Write-Error "Pattern not found: $pattern"
-                  exit 1
-              }
+            param (
+              [string]$pattern,
+              [string]$replacement
+            )
+            $line = Get-Content $resourceFile | Select-String -Pattern $pattern | Select-Object -First 1
+            if ($line) {
+              return ($line.Line -replace $replacement).Trim()
+            } else {
+              Write-Error "Pattern not found: $pattern"
+              exit 1
+            }
           }
 
           $majorVersion = Get-Version-Component 'VER_MAJOR_VERSION' '#define VER_MAJOR_VERSION\s+'
@@ -79,13 +81,6 @@ jobs:
         working-directory: ${{env.GITHUB_WORKSPACE}}
         run: msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} ${{env.SOLUTION_FILE_PATH}} /verbosity:minimal
 
-      - name: Upload PDBs as Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.get_version.outputs.filename }}-pdbs
-          path: ${{ github.workspace }}/x64/Release/**/*.pdb
-          if-no-files-found: warn
-
       - name: Download and Bundle dlssg-to-fsr3 DLL
         id: fetch_dlssg
         working-directory: ${{ github.workspace }}
@@ -103,8 +98,8 @@ jobs:
 
           $zipFile = Get-ChildItem -Path $downloadDir -Filter "*.zip" | Select-Object -First 1
           if (-not $zipFile) {
-              Write-Error "No zip asset found in the latest optiscaler/dlssg-to-fsr3 release."
-              exit 1
+            Write-Error "No zip asset found in the latest optiscaler/dlssg-to-fsr3 release."
+            exit 1
           }
           Write-Output "Downloaded: $($zipFile.Name)"
 
@@ -114,14 +109,13 @@ jobs:
           $dllName = "dlssg_to_fsr3_amd_is_better.dll"
           $dllFile = Get-ChildItem -Path $extractPath -Filter $dllName -Recurse | Select-Object -First 1
           if (-not $dllFile) {
-              Write-Error "$dllName was not found inside $($zipFile.Name)"
-              exit 1
+            Write-Error "$dllName was not found inside $($zipFile.Name)"
+            exit 1
           }
 
           $destDir = Join-Path $env:GITHUB_WORKSPACE "x64\Release\a\OptiScaler"
           New-Item -ItemType Directory -Path $destDir -Force | Out-Null
           Copy-Item -Path $dllFile.FullName -Destination (Join-Path $destDir $dllName) -Force
-
           Write-Output "Copied $dllName to $destDir"
         continue-on-error: false
 
@@ -138,21 +132,50 @@ jobs:
         shell: powershell
         run: |
           Write-Output "Fetching commits from the last 24 hours..."
-          $commits = git log --since="1 day ago" --pretty=format:"%h|%H|%s|%an" --no-merges --first-parent
 
-          if (-not $commits) {
-              $releaseNotes = "No changes in the last 24 hours."
+          $fieldSep  = [char]0x1F   # unit separator - unlikely to appear in commit text
+          $recordSep = [char]0x1E   # record separator
+
+          $format = "%h${fieldSep}%H${fieldSep}%s${fieldSep}%b${fieldSep}%an${recordSep}"
+
+          # PowerShell captures external-command output as an array of lines, not a
+          # single string. Since commit bodies can span multiple lines, that would
+          # silently break our custom record/field separators below. Force it back
+          # into one string first.
+          $rawLogLines = git log --since="1 day ago" --no-merges --first-parent --pretty=format:"$format"
+          $rawLog = ($rawLogLines -join "`n")
+
+          if (-not $rawLog) {
+            $releaseNotes = "No changes in the last 24 hours."
           }
           else {
-              $formattedCommits = foreach ($commit in $commits) {
-                  $parts = $commit -split '\|', 4
-                  $shortHash = $parts[0]
-                  $fullHash = $parts[1]
-                  $message = $parts[2]
-                  $author = $parts[3]
-                  "- [$shortHash](https://github.com/optiscaler/OptiScaler/commit/$fullHash) $message ($author)"
+            # Split into individual commit records
+            $records = $rawLog -split [regex]::Escape($recordSep) | Where-Object { $_.Trim() -ne "" }
+
+            $formattedCommits = foreach ($record in $records) {
+              $parts = $record -split [regex]::Escape($fieldSep)
+              if ($parts.Length -lt 5) {
+                Write-Warning "Skipping malformed commit record: $record"
+                continue
               }
-              $releaseNotes = "### Changes in the Last 24 Hours`n`n" + ($formattedCommits -join "`n")
+              $shortHash = $parts[0].Trim()
+              $fullHash  = $parts[1].Trim()
+              $subject   = $parts[2].Trim()
+              $body      = $parts[3].Trim()
+              $author    = $parts[4].Trim()
+
+              $entry = "- [$shortHash](https://github.com/optiscaler/OptiScaler/commit/$fullHash) $subject ($author)"
+
+              if ($body) {
+                # Indent each line of the body so it renders as a sub-list under the commit
+                $bodyLines = $body -split "`n" | ForEach-Object { "  > $($_.Trim())" }
+                $entry += "`n" + ($bodyLines -join "`n")
+              }
+
+              $entry
+            }
+
+            $releaseNotes = "### Changes in the Last 24 Hours`n`n" + ($formattedCommits -join "`n`n")
           }
 
           # Save to a markdown file. This prevents formatting breaks when passing multiline strings to the release action.
