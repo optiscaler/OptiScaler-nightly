@@ -143,9 +143,11 @@ jobs:
           # Find the SHA recorded in the previous nightly release
           $prevTag = gh release list --repo $env:NIGHTLY_REPO --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName'
           if ($LASTEXITCODE -eq 0 -and $prevTag) {
-            $prevBody = gh release view $prevTag --repo $env:NIGHTLY_REPO --json body --jq '.body'
-            if ($LASTEXITCODE -eq 0 -and $prevBody -match '<!-- last-sha: ([0-9a-f]{40}) -->') {
-              $candidate = $Matches[1]
+            # gh returns the body as an array of lines, so join it into one string before matching
+            $prevBody = (gh release view $prevTag --repo $env:NIGHTLY_REPO --json body --jq '.body') -join "`n"
+            $m = [regex]::Match($prevBody, '<!-- last-sha: ([0-9a-f]{40}) -->')
+            if ($LASTEXITCODE -eq 0 -and $m.Success) {
+              $candidate = $m.Groups[1].Value
               # Only use it if it still exists and is an ancestor of HEAD (guards against force-pushes)
               git cat-file -e "$candidate^{commit}" 2>$null
               if ($LASTEXITCODE -eq 0) {
