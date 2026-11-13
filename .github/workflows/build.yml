@@ -157,24 +157,49 @@ jobs:
             }
           }
 
+          # Keep non-ASCII author names / messages intact
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          # Record separator (0x1e) between commits, unit separator (0x1f) between fields.
+          # Neither can appear in a commit message, and %b (body) may span several lines.
+          $rs = [string][char]0x1e
+          $us = [string][char]0x1f
+          $fmt = "%x1e%h%x1f%H%x1f%an%x1f%s%x1f%b"
+
           if ($lastSha) {
             Write-Output "Listing commits since last nightly ($lastSha)..."
-            $commits = git log "$lastSha..$head" --pretty=format:"%h|%H|%s|%an" --no-merges --first-parent
+            $raw = (git log "$lastSha..$head" "--pretty=format:$fmt" --abbrev=8 --no-merges --first-parent) -join "`n"
             $heading = "### Changes Since the Last Nightly"
             $empty   = "No changes since the last nightly."
           } else {
             Write-Output "No previous nightly SHA found, falling back to the last 24 hours..."
-            $commits = git log --since="1 day ago" --pretty=format:"%h|%H|%s|%an" --no-merges --first-parent
+            $raw = (git log --since="1 day ago" "--pretty=format:$fmt" --abbrev=8 --no-merges --first-parent) -join "`n"
             $heading = "### Changes in the Last 24 Hours"
             $empty   = "No changes in the last 24 hours."
           }
 
-          if (-not $commits) {
+          $records = @($raw -split $rs | Where-Object { $_.Trim() })
+
+          if ($records.Count -eq 0) {
             $releaseNotes = $empty
           } else {
-            $formattedCommits = foreach ($commit in $commits) {
-              $parts = $commit -split '\|', 4
-              "- [$($parts[0])](https://github.com/optiscaler/OptiScaler/commit/$($parts[1])) $($parts[2]) ($($parts[3]))"
+            $formattedCommits = foreach ($rec in $records) {
+              $f = $rec -split $us, 5
+              $short = $f[0].Trim()
+              $full = $f[1]
+              $author = $f[2]
+              $subject = $f[3]
+              $body = if ($f.Count -ge 5) { $f[4].Trim() } else { "" }
+
+              $entry = "- [$short](https://github.com/optiscaler/OptiScaler/commit/$full) $subject ($author)"
+              if ($body) {
+                # Commit description goes underneath as a blockquote; trailing double-space keeps the line breaks
+                $quoted = ($body -split "\r?\n" | ForEach-Object {
+                  if ($_.Trim()) { "  > $($_.TrimEnd())" } else { "  >" }
+                }) -join "  `n"
+                $entry += "`n`n$quoted"
+              }
+              $entry
             }
             $releaseNotes = "$heading`n`n" + ($formattedCommits -join "`n")
           }
