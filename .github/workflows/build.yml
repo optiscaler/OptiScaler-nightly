@@ -1,8 +1,3 @@
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
 name: Scheduled Nightly Build
 
 on:
@@ -11,9 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  # Path to the solution file relative to the root of the project.
   SOLUTION_FILE_PATH: .
-  BUILD_CONFIGURATION: Release
   MAIN_REPO: 'optiscaler/OptiScaler'
 
 permissions:
@@ -33,60 +26,94 @@ jobs:
 
       - name: Extract OptiScaler Version
         id: get_version
-        working-directory: ${{ github.workspace }}
         shell: powershell
         run: |
           $resourceFile = ".\OptiScaler\resource.h"
+          if (-Not (Test-Path $resourceFile)) { Write-Error "File not found: $resourceFile"; exit 1 }
 
-          if (-Not (Test-Path $resourceFile)) {
-              Write-Error "File not found: $resourceFile"
-              exit 1
+          function Get-Version-Component([string]$name) {
+              $line = Get-Content $resourceFile | Select-String -Pattern "#define $name\s+" | Select-Object -First 1
+              if (-not $line) { Write-Error "Pattern not found: $name"; exit 1 }
+              return ($line.Line -replace "#define $name\s+").Trim()
           }
 
-          function Get-Version-Component {
-              param (
-                  [string]$pattern,
-                  [string]$replacement
-              )
-
-              $line = Get-Content $resourceFile | Select-String -Pattern $pattern | Select-Object -First 1
-
-              if ($line) {
-                  return ($line.Line -replace $replacement).Trim()
-              } else {
-                  Write-Error "Pattern not found: $pattern"
-                  exit 1
-              }
-          }
-
-          $majorVersion = Get-Version-Component 'VER_MAJOR_VERSION' '#define VER_MAJOR_VERSION\s+'
-          $minorVersion = Get-Version-Component 'VER_MINOR_VERSION' '#define VER_MINOR_VERSION\s+'
-          $hotfixVersion = Get-Version-Component 'VER_HOTFIX_VERSION' '#define VER_HOTFIX_VERSION\s+'
-          $buildVersion = Get-Version-Component 'VER_BUILD_NUMBER' '#define VER_BUILD_NUMBER\s+'
-
-          $version = "v$majorVersion.$minorVersion.$hotfixVersion-pre$buildVersion"
+          $version = "v$(Get-Version-Component VER_MAJOR_VERSION).$(Get-Version-Component VER_MINOR_VERSION).$(Get-Version-Component VER_HOTFIX_VERSION)-pre$(Get-Version-Component VER_BUILD_NUMBER)"
           $date = Get-Date -Format "yyyyMMdd"
-          $outputFileName = "OptiScaler_${version}_${date}"
-          $releaseTag = "nightly-${date}"
-
-          Write-Output "Generated Filename: $outputFileName"
-          Write-Output "Generated Release Tag: $releaseTag"
+          $sha = (git rev-parse --short=8 HEAD).Trim()
 
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "filename=$outputFileName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "release_tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        continue-on-error: false
+          "filename=OptiScaler_${version}_${date}_${sha}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release_tag=nightly-${date}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
-      - name: Build
-        working-directory: ${{env.GITHUB_WORKSPACE}}
-        run: msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} ${{env.SOLUTION_FILE_PATH}} /verbosity:minimal
+      - name: Build ReleaseDebug
+        run: msbuild /m /p:Configuration=ReleaseDebug ${{ env.SOLUTION_FILE_PATH }} /verbosity:minimal
+
+      # 1. Raw ReleaseDebug output (DLL + PDB) for crash dump analysis, taken before a\ exists
+      - name: Compress ReleaseDebug Output
+        shell: powershell
+        run: |
+          $rd = "${{ github.workspace }}\x64\ReleaseDebug"
+          if (-not (Test-Path "$rd\OptiScaler.pdb")) { Write-Error "Missing $rd\OptiScaler.pdb"; exit 1 }
+          # Skip the OptiScaler_*.7z files the ReleaseDebug post-build drops here, they duplicate the DLL/PDB
+          7z a "${{ github.workspace }}\${{ steps.get_version.outputs.filename }}_ReleaseDebug.7z" "$rd\*" '-x!*.7z'
+          if ($LASTEXITCODE -gt 1) { exit $LASTEXITCODE }
+          exit 0
+
+      - name: Upload ReleaseDebug Artifact
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: ${{ steps.get_version.outputs.filename }}_ReleaseDebug
+          path: ${{ github.workspace }}\${{ steps.get_version.outputs.filename }}_ReleaseDebug.7z
+          archive: false
+          compression-level: 0
+          if-no-files-found: error
+
+      # 2-4. Same layout as the Release post-build event in OptiScaler.vcxproj; keep the two in sync
+      - name: Create Release Package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ws = "${{ github.workspace }}"
+          $ext = "$ws\external"
+          $a = "$ws\x64\ReleaseDebug\a"
+          $opti = "$a\OptiScaler"
+          $lic = "$a\Licenses"
+          $agility = "$opti\D3D12_OptiScaler"
+          $plugins = "$opti\plugins"
+          $ffx2 = "$ext\FidelityFX-SDK-v2\Kits\FidelityFX\signedbin"
+
+          New-Item -ItemType Directory -Force $a, $opti, $lic, $agility, $plugins | Out-Null
+
+          Copy-Item "$ws\x64\ReleaseDebug\OptiScaler.dll" $a
+          Copy-Item "$ext\xess\LICENSE.txt" "$lic\XeSS_LICENSE.txt"
+          Copy-Item "$ext\xess\bin\*.dll" $opti
+          # Post-build targets a\OptiScaler\Licenses, which it never creates, so the copy fails there; a\Licenses is the intent
+          Copy-Item "$ext\FidelityFX-SDK\docs\license.md" "$lic\FidelityFX_v1_LICENSE.md"
+          Copy-Item "$ffx2\amd_fidelityfx_loader_dx12.dll" $opti
+          Copy-Item "$ffx2\amd_fidelityfx_upscaler_dx12.dll" $opti
+          Copy-Item "$ffx2\amd_fidelityfx_framegeneration_dx12.dll" $opti
+          Copy-Item "$ffx2\amd_fidelityfx_loader_vk.dll" $opti
+          Copy-Item "$ffx2\amd_fidelityfx_upscaler_vk.dll" $opti
+          Copy-Item "$ffx2\amd_fidelityfx_framegeneration_vk.dll" $opti
+          Copy-Item "$ext\FidelityFX-SDK-v2\docs\license.md" "$lic\FidelityFX_v2_LICENSE.md"
+          Copy-Item "$ws\OptiScaler.ini", "$ws\setup_windows.bat", "$ws\setup_linux.sh" $a
+          Copy-Item "$ext\directx_agility_sdk\lib\*.dll" $agility
+          Copy-Item "$ext\directx_agility_sdk\LICENSE.txt" "$lic\DirectX_LICENSE.txt"
+          New-Item -ItemType File "$a\!! EXTRACT ALL FILES TO GAME FOLDER !!" | Out-Null
+
+          # Streamlined fetcher goes next to the upscaler DLLs
+          if (-not (Test-Path "$ws\Streamlined_fetcher_windows.bat")) { Write-Error "Streamlined_fetcher_windows.bat not found" }
+          Copy-Item "$ws\Streamlined_fetcher_windows.bat" $opti -Force
+
+          # Wildcard copies don't fail on zero matches (e.g. a missing submodule), so check them
+          if (-not (Get-ChildItem "$opti\libxess*.dll")) { Write-Error "No XeSS DLLs copied" }
+          if (-not (Get-ChildItem "$agility\*.dll")) { Write-Error "No Agility SDK DLLs copied" }
 
       - name: Download and Bundle dlssg-to-fsr3 DLL
         id: fetch_dlssg
-        working-directory: ${{ github.workspace }}
         shell: powershell
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,6 +125,7 @@ jobs:
 
           Write-Output "Downloading latest release zip from optiscaler/dlssg-to-fsr3"
           gh release download --repo optiscaler/dlssg-to-fsr3 --pattern "*.zip" --dir $downloadDir --clobber
+          if ($LASTEXITCODE -ne 0) { Write-Error "gh release download failed"; exit 1 }
 
           $zipFile = Get-ChildItem -Path $downloadDir -Filter "*.zip" | Select-Object -First 1
           if (-not $zipFile) {
@@ -116,22 +144,22 @@ jobs:
               exit 1
           }
 
-          $destDir = Join-Path $env:GITHUB_WORKSPACE "x64\Release\a\OptiScaler"
+          # Same subfolder as the upscaler DLLs
+          $destDir = Join-Path $env:GITHUB_WORKSPACE "x64\ReleaseDebug\a\OptiScaler"
           New-Item -ItemType Directory -Path $destDir -Force | Out-Null
           Copy-Item -Path $dllFile.FullName -Destination (Join-Path $destDir $dllName) -Force
           Write-Output "Copied $dllName to $destDir"
-        continue-on-error: false
 
-      - name: Compress the artifact
+      - name: Compress Release Package
+        shell: powershell
         run: |
-          Copy-Item -Path "${{ github.workspace }}\Streamlined_fetcher_windows.bat" -Destination "${{ github.workspace }}\x64\Release\a\OptiScaler" -Force
-          $zipName = "${{ steps.get_version.outputs.filename }}.7z"
-          7z a -r ${{ github.workspace }}\$zipName ${{ github.workspace }}\x64\Release\a\*.*
-        continue-on-error: false
+          $ErrorActionPreference = "Stop"
+          $a = "${{ github.workspace }}\x64\ReleaseDebug\a"
+          7z a "${{ github.workspace }}\${{ steps.get_version.outputs.filename }}.7z" "$a\*"
+          if ($LASTEXITCODE -gt 1) { exit $LASTEXITCODE }
+          exit 0
 
       - name: Generate Changelog
-        id: commit_messages
-        working-directory: ${{ github.workspace }}
         shell: powershell
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -143,7 +171,6 @@ jobs:
           # Find the SHA recorded in the previous nightly release
           $prevTag = gh release list --repo $env:NIGHTLY_REPO --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName'
           if ($LASTEXITCODE -eq 0 -and $prevTag) {
-            # gh returns the body as an array of lines, so join it into one string before matching
             $prevBody = (gh release view $prevTag --repo $env:NIGHTLY_REPO --json body --jq '.body') -join "`n"
             $m = [regex]::Match($prevBody, '<!-- last-sha: ([0-9a-f]{40}) -->')
             if ($LASTEXITCODE -eq 0 -and $m.Success) {
@@ -157,22 +184,18 @@ jobs:
             }
           }
 
-          # Keep non-ASCII author names / messages intact
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-          # Record separator (0x1e) between commits, unit separator (0x1f) between fields.
-          # Neither can appear in a commit message, and %b (body) may span several lines.
+          # 0x1e between commits, 0x1f between fields; %b may span several lines
           $rs = [string][char]0x1e
           $us = [string][char]0x1f
           $fmt = "%x1e%h%x1f%H%x1f%an%x1f%s%x1f%b"
 
           if ($lastSha) {
-            Write-Output "Listing commits since last nightly ($lastSha)..."
             $raw = (git log "$lastSha..$head" "--pretty=format:$fmt" --abbrev=8 --no-merges --first-parent) -join "`n"
             $heading = "### Changes Since the Last Nightly"
             $empty   = "No changes since the last nightly."
           } else {
-            Write-Output "No previous nightly SHA found, falling back to the last 24 hours..."
             $raw = (git log --since="1 day ago" "--pretty=format:$fmt" --abbrev=8 --no-merges --first-parent) -join "`n"
             $heading = "### Changes in the Last 24 Hours"
             $empty   = "No changes in the last 24 hours."
@@ -185,15 +208,9 @@ jobs:
           } else {
             $formattedCommits = foreach ($rec in $records) {
               $f = $rec -split $us, 5
-              $short = $f[0].Trim()
-              $full = $f[1]
-              $author = $f[2]
-              $subject = $f[3]
               $body = if ($f.Count -ge 5) { $f[4].Trim() } else { "" }
-
-              $entry = "- [$short](https://github.com/optiscaler/OptiScaler/commit/$full) $subject ($author)"
+              $entry = "- [$($f[0].Trim())](https://github.com/${{ env.MAIN_REPO }}/commit/$($f[1])) $($f[3]) ($($f[2]))"
               if ($body) {
-                # Commit description goes underneath as a blockquote; trailing double-space keeps the line breaks
                 $quoted = ($body -split "\r?\n" | ForEach-Object {
                   if ($_.Trim()) { "  > $($_.TrimEnd())" } else { "  >" }
                 }) -join "  `n"
@@ -206,11 +223,9 @@ jobs:
 
           # Hidden marker so the next run knows where to start
           $releaseNotes += "`n`n<!-- last-sha: $head -->"
-
-          # Save to a markdown file. This prevents formatting breaks when passing multiline strings to the release action.
           $releaseNotes | Out-File -FilePath release_notes.md -Encoding utf8
 
-      - name: Create Release and Upload Artifact
+      - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.get_version.outputs.release_tag }}
